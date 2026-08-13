@@ -1,0 +1,502 @@
+package nexus
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	// DefaultMaxCompressedBytes permits a gzip chunk up to 8 GiB.
+	DefaultMaxCompressedBytes int64 = 8 << 30
+	// DefaultMaxRedirects bounds redirects for every request.
+	DefaultMaxRedirects = 10
+	// DefaultMaxRetries permits two retries after the initial request.
+	DefaultMaxRetries = 2
+
+	defaultRetryBaseDelay = 250 * time.Millisecond
+	defaultMaxRetryDelay  = 30 * time.Second
+	defaultDialTimeout    = 30 * time.Second
+	defaultKeepAlive      = 30 * time.Second
+	defaultHeaderTimeout  = 30 * time.Second
+)
+
+var (
+	// ErrCompressedLimit is returned when a chunk exceeds its compressed-byte
+	// limit.
+	ErrCompressedLimit = errors.New("nexus: compressed chunk exceeds size limit")
+	// ErrIndexNotFound is returned when a repository has no index properties.
+	ErrIndexNotFound = errors.New("nexus: Maven index properties not found")
+	// ErrPrivateAddress is returned when strict address policy blocks a host.
+	ErrPrivateAddress = errors.New("nexus: refusing non-public address")
+	// ErrUnsafeURL is returned when a URL violates the remote URL policy.
+	ErrUnsafeURL = errors.New("nexus: remote URL rejected")
+)
+
+// ClientOptions configures remote repository synchronization. The zero value
+// uses safe defaults.
+type ClientOptions struct {
+	HTTPClient            *http.Client
+	ParserOptions         Options
+	MaxPropertiesBytes    int64
+	MaxCompressedBytes    int64
+	MaxRedirects          int
+	MaxRetries            int
+	RetryBaseDelay        time.Duration
+	MaxRetryDelay         time.Duration
+	UserAgent             string
+	AllowPrivateAddresses bool
+}
+
+type normalizedClientOptions struct {
+	parserOptions         Options
+	maxPropertiesBytes    int64
+	maxCompressedBytes    int64
+	maxRedirects          int
+	maxRetries            int
+	retryBaseDelay        time.Duration
+	maxRetryDelay         time.Duration
+	userAgent             string
+	allowPrivateAddresses bool
+}
+
+// Client downloads and streams Maven repository indexes.
+type Client struct {
+	http      *http.Client
+	options   normalizedClientOptions
+	configErr error
+}
+
+// HTTPStatusError reports a non-success response from an index endpoint.
+type HTTPStatusError struct {
+	StatusCode int
+	URL        string
+}
+
+func (err *HTTPStatusError) Error() string {
+	return fmt.Sprintf("nexus: GET %s returned HTTP %d", err.URL, err.StatusCode)
+}
+
+// NewClient returns a synchronization client. Invalid options are reported by
+// Sync so construction retains the small API shown in the specification.
+func NewClient(options ClientOptions) *Client {
+	normalized, err := normalizeClientOptions(options)
+	client := &Client{options: normalized, configErr: err}
+	if err != nil {
+		return client
+	}
+
+	httpClient := http.Client{}
+	if options.HTTPClient != nil {
+		httpClient = *options.HTTPClient
+	}
+	policy := addressPolicy{allowPrivate: normalized.allowPrivateAddresses}
+	httpClient.Transport = protectedTransport(httpClient.Transport, policy)
+	previousRedirect := httpClient.CheckRedirect
+	httpClient.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if len(via) >= normalized.maxRedirects {
+			return fmt.Errorf("%w: stopped after %d redirects", ErrUnsafeURL, normalized.maxRedirects)
+		}
+		if err := validateRemoteURL(request.URL); err != nil {
+			return err
+		}
+		if previousRedirect != nil {
+			return previousRedirect(request, via)
+		}
+		return nil
+	}
+	client.http = &httpClient
+	return client
+}
+
+func normalizeClientOptions(options ClientOptions) (normalizedClientOptions, error) {
+	normalized := normalizedClientOptions{
+		parserOptions:         options.ParserOptions,
+		maxPropertiesBytes:    options.MaxPropertiesBytes,
+		maxCompressedBytes:    options.MaxCompressedBytes,
+		maxRedirects:          options.MaxRedirects,
+		maxRetries:            options.MaxRetries,
+		retryBaseDelay:        options.RetryBaseDelay,
+		maxRetryDelay:         options.MaxRetryDelay,
+		userAgent:             options.UserAgent,
+		allowPrivateAddresses: options.AllowPrivateAddresses,
+	}
+	if normalized.maxPropertiesBytes == 0 {
+		normalized.maxPropertiesBytes = DefaultMaxPropertiesBytes
+	}
+	if normalized.maxCompressedBytes == 0 {
+		normalized.maxCompressedBytes = DefaultMaxCompressedBytes
+	}
+	if normalized.maxRedirects == 0 {
+		normalized.maxRedirects = DefaultMaxRedirects
+	}
+	if normalized.maxRetries == 0 {
+		normalized.maxRetries = DefaultMaxRetries
+	}
+	if normalized.retryBaseDelay == 0 {
+		normalized.retryBaseDelay = defaultRetryBaseDelay
+	}
+	if normalized.maxRetryDelay == 0 {
+		normalized.maxRetryDelay = defaultMaxRetryDelay
+	}
+	if normalized.userAgent == "" {
+		normalized.userAgent = defaultUserAgent()
+	}
+
+	if normalized.maxPropertiesBytes < 0 {
+		return normalizedClientOptions{}, errors.New("nexus: maximum properties bytes must not be negative")
+	}
+	if normalized.maxCompressedBytes < 0 {
+		return normalizedClientOptions{}, errors.New("nexus: maximum compressed bytes must not be negative")
+	}
+	if normalized.maxRedirects < 0 {
+		return normalizedClientOptions{}, errors.New("nexus: maximum redirects must not be negative")
+	}
+	if normalized.maxRetries < 0 {
+		return normalizedClientOptions{}, errors.New("nexus: maximum retries must not be negative")
+	}
+	if normalized.retryBaseDelay < 0 || normalized.maxRetryDelay < 0 {
+		return normalizedClientOptions{}, errors.New("nexus: retry delays must not be negative")
+	}
+	return normalized, nil
+}
+
+func defaultUserAgent() string {
+	version := Version
+	if version == "" || version == "dev" {
+		version = "devel"
+		if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+			version = info.Main.Version
+		}
+	}
+	version = strings.TrimPrefix(version, "v")
+	return "git-pkgs-nexus/" + version
+}
+
+func protectedTransport(base http.RoundTripper, policy addressPolicy) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if transport, ok := base.(*http.Transport); ok {
+		clone := transport.Clone()
+		if clone.ResponseHeaderTimeout == 0 {
+			clone.ResponseHeaderTimeout = defaultHeaderTimeout
+		}
+		underlying := clone.DialContext
+		if underlying == nil {
+			dialer := &net.Dialer{Timeout: defaultDialTimeout, KeepAlive: defaultKeepAlive}
+			underlying = dialer.DialContext
+		}
+		clone.DialContext = policy.dialContext(underlying)
+		base = clone
+	}
+	return &checkingRoundTripper{base: base, policy: policy}
+}
+
+type checkingRoundTripper struct {
+	base   http.RoundTripper
+	policy addressPolicy
+}
+
+func (transport *checkingRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if err := validateRemoteURL(request.URL); err != nil {
+		return nil, err
+	}
+	if err := transport.policy.checkHost(request.Context(), request.URL.Hostname()); err != nil {
+		return nil, err
+	}
+	return transport.base.RoundTrip(request)
+}
+
+type addressPolicy struct {
+	allowPrivate bool
+}
+
+func (policy addressPolicy) checkHost(ctx context.Context, host string) error {
+	if policy.allowPrivate {
+		return nil
+	}
+	if host == "" {
+		return errors.New("nexus: remote URL has no host")
+	}
+	if parsed := net.ParseIP(host); parsed != nil {
+		return checkPublicIP(parsed)
+	}
+	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return fmt.Errorf("nexus: resolve %s: %w", host, err)
+	}
+	if len(addresses) == 0 {
+		return fmt.Errorf("nexus: no addresses resolved for %s", host)
+	}
+	for _, address := range addresses {
+		if err := checkPublicIP(address.IP); err != nil {
+			return fmt.Errorf("nexus: host %s: %w", host, err)
+		}
+	}
+	return nil
+}
+
+func (policy addressPolicy) dialContext(underlying func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		if policy.allowPrivate {
+			return underlying(ctx, network, address)
+		}
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		if parsed := net.ParseIP(host); parsed != nil {
+			if err := checkPublicIP(parsed); err != nil {
+				return nil, err
+			}
+			return underlying(ctx, network, address)
+		}
+		addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		var lastErr error
+		for _, candidate := range addresses {
+			if err := checkPublicIP(candidate.IP); err != nil {
+				return nil, fmt.Errorf("nexus: host %s: %w", host, err)
+			}
+			connection, dialErr := underlying(ctx, network, net.JoinHostPort(candidate.IP.String(), port))
+			if dialErr == nil {
+				return connection, nil
+			}
+			lastErr = dialErr
+		}
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("nexus: no addresses resolved for %s", host)
+	}
+}
+
+var carrierGradeNAT = mustNetwork("100.64.0.0/10")
+
+func mustNetwork(cidr string) *net.IPNet {
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		panic(err)
+	}
+	return network
+}
+
+func checkPublicIP(address net.IP) error {
+	kind := ""
+	switch {
+	case address.IsUnspecified():
+		kind = "unspecified"
+	case address.IsLoopback():
+		kind = "loopback"
+	case address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast():
+		kind = "link-local"
+	case address.IsMulticast() || address.IsInterfaceLocalMulticast():
+		kind = "multicast"
+	case address.IsPrivate():
+		kind = "private"
+	case carrierGradeNAT.Contains(address):
+		kind = "CGNAT"
+	}
+	if kind != "" {
+		return fmt.Errorf("%w: %s (%s)", ErrPrivateAddress, address, kind)
+	}
+	return nil
+}
+
+func validateRepositoryURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("nexus: parse repository URL: %w", err)
+	}
+	if err := validateRemoteURL(parsed); err != nil {
+		return nil, err
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("%w: repository URL must not contain a query or fragment", ErrUnsafeURL)
+	}
+	return parsed, nil
+}
+
+func validateRemoteURL(remote *url.URL) error {
+	if remote == nil {
+		return fmt.Errorf("%w: nil remote URL", ErrUnsafeURL)
+	}
+	if remote.Scheme != "http" && remote.Scheme != "https" {
+		return fmt.Errorf("%w: unsupported remote URL scheme %q", ErrUnsafeURL, remote.Scheme)
+	}
+	if remote.Host == "" {
+		return fmt.Errorf("%w: remote URL has no host", ErrUnsafeURL)
+	}
+	if remote.User != nil {
+		return fmt.Errorf("%w: credentials in remote URLs are not allowed", ErrUnsafeURL)
+	}
+	return nil
+}
+
+func resolveRepositoryPath(repository *url.URL, relative string) *url.URL {
+	resolved := repository.JoinPath(relative)
+	resolved.RawQuery = ""
+	resolved.Fragment = ""
+	return resolved
+}
+
+func (client *Client) do(ctx context.Context, remote *url.URL, headers http.Header) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, remote.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("Accept-Encoding", "identity")
+		request.Header.Set("User-Agent", client.options.userAgent)
+		for name, values := range headers {
+			for _, value := range values {
+				request.Header.Add(name, value)
+			}
+		}
+
+		response, err := client.http.Do(request)
+		if err == nil && !retryableStatus(response.StatusCode) {
+			return response, nil
+		}
+		if err != nil && !retryableRequestError(ctx, err) {
+			return nil, err
+		}
+		if attempt >= client.options.maxRetries {
+			if err != nil {
+				return nil, err
+			}
+			return response, nil
+		}
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+
+		delay := client.retryDelay(attempt, response)
+		if err := waitContext(ctx, delay); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func retryableRequestError(ctx context.Context, err error) bool {
+	return ctx.Err() == nil &&
+		!errors.Is(err, ErrPrivateAddress) &&
+		!errors.Is(err, ErrUnsafeURL)
+}
+
+func retryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable
+}
+
+func (client *Client) retryDelay(attempt int, response *http.Response) time.Duration {
+	if response != nil {
+		if retryAfter, ok := parseRetryAfter(response.Header.Get("Retry-After")); ok {
+			return min(retryAfter, client.options.maxRetryDelay)
+		}
+	}
+	delay := client.options.retryBaseDelay
+	for range attempt {
+		if delay >= client.options.maxRetryDelay/2 {
+			return client.options.maxRetryDelay
+		}
+		delay *= 2
+	}
+	return min(delay, client.options.maxRetryDelay)
+}
+
+func parseRetryAfter(value string) (time.Duration, bool) {
+	if value == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
+		if seconds > int64((time.Duration(1<<63-1))/time.Second) {
+			return time.Duration(1<<63 - 1), true
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	return max(time.Until(when), 0), true
+}
+
+func waitContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func closeResponse(response *http.Response) {
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
+}
+
+func statusError(response *http.Response) error {
+	remote := "unknown URL"
+	if response.Request != nil && response.Request.URL != nil {
+		remote = response.Request.URL.String()
+	}
+	return &HTTPStatusError{StatusCode: response.StatusCode, URL: remote}
+}
+
+func boundedBody(response *http.Response, limit int64) (io.ReadCloser, error) {
+	if response.ContentLength > limit {
+		closeResponse(response)
+		return nil, fmt.Errorf("%w: content length is %d, maximum is %d", ErrCompressedLimit, response.ContentLength, limit)
+	}
+	return &maxReadCloser{reader: response.Body, remaining: limit, limit: limit}, nil
+}
+
+type maxReadCloser struct {
+	reader    io.ReadCloser
+	remaining int64
+	limit     int64
+}
+
+func (reader *maxReadCloser) Read(buffer []byte) (int, error) {
+	if len(buffer) == 0 {
+		return 0, nil
+	}
+	if reader.remaining == 0 {
+		var probe [1]byte
+		read, err := reader.reader.Read(probe[:])
+		if read > 0 {
+			return 0, fmt.Errorf("%w: maximum is %d bytes", ErrCompressedLimit, reader.limit)
+		}
+		return 0, err
+	}
+	if int64(len(buffer)) > reader.remaining {
+		buffer = buffer[:int(reader.remaining)]
+	}
+	read, err := reader.reader.Read(buffer)
+	reader.remaining -= int64(read)
+	return read, err
+}
+
+func (reader *maxReadCloser) Close() error {
+	return reader.reader.Close()
+}
