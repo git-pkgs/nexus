@@ -22,10 +22,13 @@ const (
 	DefaultMaxFieldNameBytes int64 = 1<<16 - 1
 	// DefaultMaxFieldValueBytes permits a field value up to 64 MiB.
 	DefaultMaxFieldValueBytes int64 = 64 << 20
-	// DefaultMaxRecordBytes bounds retained name and value data to 128 MiB.
+	// DefaultMaxRecordBytes bounds encoded name and value data in one record to
+	// 128 MiB.
 	DefaultMaxRecordBytes int64 = 128 << 20
 
 	supportedChunkVersion = 1
+	discardBufferSize     = 32 << 10
+	selectedFieldCapacity = 7
 )
 
 var (
@@ -93,18 +96,19 @@ type normalizedOptions struct {
 
 // RawReader streams raw records from exactly one gzip member.
 type RawReader struct {
-	compressed  *bufio.Reader
-	gzip        *gzip.Reader
-	decoded     *maxBytesReader
-	options     normalizedOptions
-	header      Header
-	records     int64
-	scratch     [8]byte
-	nameBuffer  []byte
-	valueBuffer []byte
-	done        bool
-	closed      bool
-	terminal    error
+	compressed    *bufio.Reader
+	gzip          *gzip.Reader
+	decoded       *maxBytesReader
+	options       normalizedOptions
+	header        Header
+	records       int64
+	scratch       [8]byte
+	nameBuffer    []byte
+	valueBuffer   []byte
+	discardBuffer []byte
+	done          bool
+	closed        bool
+	terminal      error
 }
 
 // NewRawReader opens a Maven index chunk and reads its binary header.
@@ -164,6 +168,12 @@ func (reader *RawReader) Header() Header {
 
 // NextRecord returns the next raw record in file order.
 func (reader *RawReader) NextRecord() (Record, error) {
+	return reader.nextRecord(nil)
+}
+
+type fieldSelector func(string) bool
+
+func (reader *RawReader) nextRecord(selector fieldSelector) (Record, error) {
 	if reader.closed {
 		return Record{}, ErrClosed
 	}
@@ -195,15 +205,26 @@ func (reader *RawReader) NextRecord() (Record, error) {
 		return reader.fail(fmt.Errorf("nexus: record %d has %d fields, maximum is %d", reader.records+1, fieldCount, reader.options.maxFieldsPerRecord))
 	}
 
-	record := Record{Fields: make([]Field, 0, int(fieldCount))}
+	fieldCapacity := int(fieldCount)
+	if selector != nil {
+		fieldCapacity = min(fieldCapacity, selectedFieldCapacity)
+	}
+	record := Record{Fields: make([]Field, 0, fieldCapacity)}
 	var recordBytes int64
 	for fieldIndex := int32(0); fieldIndex < fieldCount; fieldIndex++ {
-		field, encodedBytes, fieldErr := reader.readField(reader.records+1, int64(fieldIndex)+1, recordBytes)
+		field, selected, encodedBytes, fieldErr := reader.readField(
+			reader.records+1,
+			int64(fieldIndex)+1,
+			recordBytes,
+			selector,
+		)
 		if fieldErr != nil {
 			return reader.fail(fieldErr)
 		}
 		recordBytes += encodedBytes
-		record.Fields = append(record.Fields, field)
+		if selected {
+			record.Fields = append(record.Fields, field)
+		}
 	}
 	reader.records++
 	return record, nil
@@ -234,58 +255,91 @@ func (reader *RawReader) readFieldCount() (int32, bool, error) {
 	return 0, false, fmt.Errorf("nexus: read record field count: %w", err)
 }
 
-func (reader *RawReader) readField(recordNumber, fieldNumber, recordBytes int64) (Field, int64, error) {
+func (reader *RawReader) readField(
+	recordNumber, fieldNumber, recordBytes int64,
+	selector fieldSelector,
+) (Field, bool, int64, error) {
 	if err := readFieldRequired(reader.decoded, reader.scratch[:1], recordNumber, fieldNumber, "flags"); err != nil {
-		return Field{}, 0, err
+		return Field{}, false, 0, err
 	}
 	flags := reader.scratch[0]
 
 	if err := readFieldRequired(reader.decoded, reader.scratch[:2], recordNumber, fieldNumber, "name length"); err != nil {
-		return Field{}, 0, err
+		return Field{}, false, 0, err
 	}
 	nameLength := int64(binary.BigEndian.Uint16(reader.scratch[:2]))
 	if nameLength > reader.options.maxFieldNameBytes {
-		return Field{}, 0, fmt.Errorf("nexus: record %d field %d name has %d encoded bytes, maximum is %d", recordNumber, fieldNumber, nameLength, reader.options.maxFieldNameBytes)
+		return Field{}, false, 0, fmt.Errorf("nexus: record %d field %d name has %d encoded bytes, maximum is %d", recordNumber, fieldNumber, nameLength, reader.options.maxFieldNameBytes)
 	}
 	if nameLength > reader.options.maxRecordBytes-recordBytes {
-		return Field{}, 0, fmt.Errorf("nexus: record %d exceeds encoded byte limit %d", recordNumber, reader.options.maxRecordBytes)
+		return Field{}, false, 0, fmt.Errorf("nexus: record %d exceeds encoded byte limit %d", recordNumber, reader.options.maxRecordBytes)
 	}
 	nameBytes := resizeBuffer(&reader.nameBuffer, int(nameLength))
 	if err := readFieldRequired(reader.decoded, nameBytes, recordNumber, fieldNumber, "name"); err != nil {
-		return Field{}, 0, err
+		return Field{}, false, 0, err
 	}
 	name, known := canonicalFieldName(nameBytes)
 	if !known {
 		decodedName, decodeErr := decodeModifiedUTF8(nameBytes)
 		if decodeErr != nil {
-			return Field{}, 0, fmt.Errorf("nexus: record %d field %d name: %w", recordNumber, fieldNumber, decodeErr)
+			return Field{}, false, 0, fmt.Errorf("nexus: record %d field %d name: %w", recordNumber, fieldNumber, decodeErr)
 		}
 		name = decodedName
 	}
 
 	if err := readFieldRequired(reader.decoded, reader.scratch[:4], recordNumber, fieldNumber, "value length"); err != nil {
-		return Field{}, 0, err
+		return Field{}, false, 0, err
 	}
 	valueLength := int64(int32(binary.BigEndian.Uint32(reader.scratch[:4])))
 	if valueLength < 0 {
-		return Field{}, 0, fmt.Errorf("nexus: record %d field %d has negative value length %d", recordNumber, fieldNumber, valueLength)
+		return Field{}, false, 0, fmt.Errorf("nexus: record %d field %d has negative value length %d", recordNumber, fieldNumber, valueLength)
 	}
 	if valueLength > reader.options.maxFieldValueBytes {
-		return Field{}, 0, fmt.Errorf("nexus: record %d field %d value has %d encoded bytes, maximum is %d", recordNumber, fieldNumber, valueLength, reader.options.maxFieldValueBytes)
+		return Field{}, false, 0, fmt.Errorf("nexus: record %d field %d value has %d encoded bytes, maximum is %d", recordNumber, fieldNumber, valueLength, reader.options.maxFieldValueBytes)
 	}
 	encodedBytes := nameLength + valueLength
 	if encodedBytes > reader.options.maxRecordBytes-recordBytes {
-		return Field{}, 0, fmt.Errorf("nexus: record %d exceeds encoded byte limit %d", recordNumber, reader.options.maxRecordBytes)
+		return Field{}, false, 0, fmt.Errorf("nexus: record %d exceeds encoded byte limit %d", recordNumber, reader.options.maxRecordBytes)
+	}
+	if selector != nil && !selector(name) {
+		if err := reader.validateDiscardedValue(valueLength, recordNumber, fieldNumber); err != nil {
+			return Field{}, false, 0, err
+		}
+		return Field{}, false, encodedBytes, nil
 	}
 	valueBytes := resizeBuffer(&reader.valueBuffer, int(valueLength))
 	if err := readFieldRequired(reader.decoded, valueBytes, recordNumber, fieldNumber, "value"); err != nil {
-		return Field{}, 0, err
+		return Field{}, false, 0, err
 	}
 	value, err := decodeModifiedUTF8(valueBytes)
 	if err != nil {
-		return Field{}, 0, fmt.Errorf("nexus: record %d field %d value: %w", recordNumber, fieldNumber, err)
+		return Field{}, false, 0, fmt.Errorf("nexus: record %d field %d value: %w", recordNumber, fieldNumber, err)
 	}
-	return Field{Flags: flags, Name: name, Value: value}, encodedBytes, nil
+	return Field{Flags: flags, Name: name, Value: value}, true, encodedBytes, nil
+}
+
+func (reader *RawReader) validateDiscardedValue(valueLength, recordNumber, fieldNumber int64) error {
+	if valueLength > 0 {
+		bufferLength := int(min(valueLength, int64(discardBufferSize)))
+		resizeBuffer(&reader.discardBuffer, bufferLength)
+	}
+	validator := modifiedUTF8Validator{}
+	remaining := valueLength
+	for remaining > 0 {
+		readSize := min(remaining, int64(len(reader.discardBuffer)))
+		buffer := reader.discardBuffer[:int(readSize)]
+		if err := readFieldRequired(reader.decoded, buffer, recordNumber, fieldNumber, "value"); err != nil {
+			return err
+		}
+		if err := validator.Write(buffer); err != nil {
+			return fmt.Errorf("nexus: record %d field %d value: %w", recordNumber, fieldNumber, err)
+		}
+		remaining -= readSize
+	}
+	if err := validator.Finish(); err != nil {
+		return fmt.Errorf("nexus: record %d field %d value: %w", recordNumber, fieldNumber, err)
+	}
+	return nil
 }
 
 func (reader *RawReader) finish() error {

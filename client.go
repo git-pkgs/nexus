@@ -11,6 +11,8 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +29,7 @@ const (
 	defaultDialTimeout    = 30 * time.Second
 	defaultKeepAlive      = 30 * time.Second
 	defaultHeaderTimeout  = 30 * time.Second
+	defaultIdleTimeout    = 30 * time.Second
 )
 
 var (
@@ -37,8 +40,14 @@ var (
 	ErrIndexNotFound = errors.New("nexus: Maven index properties not found")
 	// ErrPrivateAddress is returned when strict address policy blocks a host.
 	ErrPrivateAddress = errors.New("nexus: refusing non-public address")
+	// ErrResponseIdleTimeout is returned when a response body read receives no
+	// data before the configured idle timeout.
+	ErrResponseIdleTimeout = errors.New("nexus: response body idle timeout")
 	// ErrUnsafeURL is returned when a URL violates the remote URL policy.
 	ErrUnsafeURL = errors.New("nexus: remote URL rejected")
+	// ErrUnprotectedTransport is returned when strict address policy cannot be
+	// enforced by a custom HTTP transport or proxy.
+	ErrUnprotectedTransport = errors.New("nexus: HTTP transport cannot enforce public-address policy")
 )
 
 // ClientOptions configures remote repository synchronization. The zero value
@@ -52,6 +61,7 @@ type ClientOptions struct {
 	MaxRetries            int
 	RetryBaseDelay        time.Duration
 	MaxRetryDelay         time.Duration
+	ResponseIdleTimeout   time.Duration
 	UserAgent             string
 	AllowPrivateAddresses bool
 }
@@ -64,6 +74,7 @@ type normalizedClientOptions struct {
 	maxRetries            int
 	retryBaseDelay        time.Duration
 	maxRetryDelay         time.Duration
+	responseIdleTimeout   time.Duration
 	userAgent             string
 	allowPrivateAddresses bool
 }
@@ -98,8 +109,16 @@ func NewClient(options ClientOptions) *Client {
 	if options.HTTPClient != nil {
 		httpClient = *options.HTTPClient
 	}
-	policy := addressPolicy{allowPrivate: normalized.allowPrivateAddresses}
-	httpClient.Transport = protectedTransport(httpClient.Transport, policy)
+	policy := addressPolicy{
+		allowPrivate:        normalized.allowPrivateAddresses,
+		responseIdleTimeout: normalized.responseIdleTimeout,
+	}
+	protected, transportErr := protectedTransport(httpClient.Transport, policy)
+	if transportErr != nil {
+		client.configErr = transportErr
+		return client
+	}
+	httpClient.Transport = protected
 	previousRedirect := httpClient.CheckRedirect
 	httpClient.CheckRedirect = func(request *http.Request, via []*http.Request) error {
 		if len(via) >= normalized.maxRedirects {
@@ -126,6 +145,7 @@ func normalizeClientOptions(options ClientOptions) (normalizedClientOptions, err
 		maxRetries:            options.MaxRetries,
 		retryBaseDelay:        options.RetryBaseDelay,
 		maxRetryDelay:         options.MaxRetryDelay,
+		responseIdleTimeout:   options.ResponseIdleTimeout,
 		userAgent:             options.UserAgent,
 		allowPrivateAddresses: options.AllowPrivateAddresses,
 	}
@@ -147,6 +167,9 @@ func normalizeClientOptions(options ClientOptions) (normalizedClientOptions, err
 	if normalized.maxRetryDelay == 0 {
 		normalized.maxRetryDelay = defaultMaxRetryDelay
 	}
+	if normalized.responseIdleTimeout == 0 {
+		normalized.responseIdleTimeout = defaultIdleTimeout
+	}
 	if normalized.userAgent == "" {
 		normalized.userAgent = defaultUserAgent()
 	}
@@ -166,6 +189,9 @@ func normalizeClientOptions(options ClientOptions) (normalizedClientOptions, err
 	if normalized.retryBaseDelay < 0 || normalized.maxRetryDelay < 0 {
 		return normalizedClientOptions{}, errors.New("nexus: retry delays must not be negative")
 	}
+	if normalized.responseIdleTimeout < 0 {
+		return normalizedClientOptions{}, errors.New("nexus: response idle timeout must not be negative")
+	}
 	return normalized, nil
 }
 
@@ -181,29 +207,55 @@ func defaultUserAgent() string {
 	return "git-pkgs-nexus/" + version
 }
 
-func protectedTransport(base http.RoundTripper, policy addressPolicy) http.RoundTripper {
+func protectedTransport(base http.RoundTripper, policy addressPolicy) (http.RoundTripper, error) {
+	usingDefault := base == nil
+	defaultTransport, defaultIsHTTP := http.DefaultTransport.(*http.Transport)
+	if transport, ok := base.(*http.Transport); ok && defaultIsHTTP && transport == defaultTransport {
+		usingDefault = true
+	}
 	if base == nil {
 		base = http.DefaultTransport
 	}
 	if transport, ok := base.(*http.Transport); ok {
 		clone := transport.Clone()
+		if !policy.allowPrivate {
+			if !usingDefault && clone.Proxy != nil {
+				return nil, fmt.Errorf("%w: proxies require AllowPrivateAddresses", ErrUnprotectedTransport)
+			}
+			if !usingDefault && clone.DialContext != nil {
+				return nil, fmt.Errorf("%w: custom dialers require AllowPrivateAddresses", ErrUnprotectedTransport)
+			}
+			hasCustomTLSDialer := clone.DialTLSContext != nil
+			hasCustomTLSDialer = hasCustomTLSDialer || clone.DialTLS != nil //nolint:staticcheck // DialTLS remains supported and bypasses DialContext.
+			if hasCustomTLSDialer {
+				return nil, fmt.Errorf("%w: custom TLS dialers require AllowPrivateAddresses", ErrUnprotectedTransport)
+			}
+			clone.Proxy = nil
+		}
 		if clone.ResponseHeaderTimeout == 0 {
 			clone.ResponseHeaderTimeout = defaultHeaderTimeout
 		}
 		underlying := clone.DialContext
-		if underlying == nil {
+		if !policy.allowPrivate || underlying == nil {
 			dialer := &net.Dialer{Timeout: defaultDialTimeout, KeepAlive: defaultKeepAlive}
 			underlying = dialer.DialContext
 		}
 		clone.DialContext = policy.dialContext(underlying)
 		base = clone
+	} else if !policy.allowPrivate {
+		return nil, fmt.Errorf("%w: custom RoundTripper requires AllowPrivateAddresses", ErrUnprotectedTransport)
 	}
-	return &checkingRoundTripper{base: base, policy: policy}
+	return &checkingRoundTripper{
+		base:                base,
+		policy:              policy,
+		responseIdleTimeout: policy.responseIdleTimeout,
+	}, nil
 }
 
 type checkingRoundTripper struct {
-	base   http.RoundTripper
-	policy addressPolicy
+	base                http.RoundTripper
+	policy              addressPolicy
+	responseIdleTimeout time.Duration
 }
 
 func (transport *checkingRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -213,11 +265,19 @@ func (transport *checkingRoundTripper) RoundTrip(request *http.Request) (*http.R
 	if err := transport.policy.checkHost(request.Context(), request.URL.Hostname()); err != nil {
 		return nil, err
 	}
-	return transport.base.RoundTrip(request)
+	response, err := transport.base.RoundTrip(request)
+	if err != nil {
+		return nil, err
+	}
+	if response.Body != nil && transport.responseIdleTimeout > 0 {
+		response.Body = newIdleReadCloser(response.Body, transport.responseIdleTimeout)
+	}
+	return response, nil
 }
 
 type addressPolicy struct {
-	allowPrivate bool
+	allowPrivate        bool
+	responseIdleTimeout time.Duration
 }
 
 func (policy addressPolicy) checkHost(ctx context.Context, host string) error {
@@ -282,7 +342,122 @@ func (policy addressPolicy) dialContext(underlying func(context.Context, string,
 	}
 }
 
-var carrierGradeNAT = mustNetwork("100.64.0.0/10")
+const (
+	idleBodyOpen uint32 = iota
+	idleBodyClosed
+	idleBodyTimedOut
+)
+
+type idleReadCloser struct {
+	body      io.ReadCloser
+	timeout   time.Duration
+	state     atomic.Uint32
+	activity  chan struct{}
+	stop      chan struct{}
+	stopOnce  sync.Once
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func newIdleReadCloser(body io.ReadCloser, timeout time.Duration) *idleReadCloser {
+	reader := &idleReadCloser{
+		body:     body,
+		timeout:  timeout,
+		activity: make(chan struct{}, 1),
+		stop:     make(chan struct{}),
+	}
+	go reader.monitor()
+	return reader
+}
+
+func (reader *idleReadCloser) Read(buffer []byte) (int, error) {
+	if reader.state.Load() == idleBodyTimedOut {
+		return 0, responseIdleTimeoutError{timeout: reader.timeout}
+	}
+	read, err := reader.body.Read(buffer)
+	if reader.state.Load() == idleBodyTimedOut {
+		return read, responseIdleTimeoutError{timeout: reader.timeout}
+	}
+	if read > 0 {
+		select {
+		case reader.activity <- struct{}{}:
+		default:
+		}
+	}
+	if err != nil {
+		reader.stopMonitor()
+	}
+	return read, err
+}
+
+func (reader *idleReadCloser) Close() error {
+	reader.state.CompareAndSwap(idleBodyOpen, idleBodyClosed)
+	reader.stopMonitor()
+	reader.closeBody()
+	return reader.closeErr
+}
+
+func (reader *idleReadCloser) monitor() {
+	timer := time.NewTimer(reader.timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			if reader.state.CompareAndSwap(idleBodyOpen, idleBodyTimedOut) {
+				reader.closeBody()
+			}
+			return
+		case <-reader.activity:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(reader.timeout)
+		case <-reader.stop:
+			return
+		}
+	}
+}
+
+func (reader *idleReadCloser) stopMonitor() {
+	reader.stopOnce.Do(func() {
+		close(reader.stop)
+	})
+}
+
+func (reader *idleReadCloser) closeBody() {
+	reader.closeOnce.Do(func() {
+		reader.closeErr = reader.body.Close()
+	})
+}
+
+type responseIdleTimeoutError struct {
+	timeout time.Duration
+}
+
+func (err responseIdleTimeoutError) Error() string {
+	return fmt.Sprintf("%s after %s", ErrResponseIdleTimeout, err.timeout)
+}
+
+func (err responseIdleTimeoutError) Unwrap() error {
+	return ErrResponseIdleTimeout
+}
+
+func (err responseIdleTimeoutError) Timeout() bool {
+	return true
+}
+
+func (err responseIdleTimeoutError) Temporary() bool {
+	return false
+}
+
+var (
+	carrierGradeNAT = mustNetwork("100.64.0.0/10")
+	wellKnownNAT64  = mustNetwork("64:ff9b::/96")
+	localUseNAT64   = mustNetwork("64:ff9b:1::/48")
+)
 
 func mustNetwork(cidr string) *net.IPNet {
 	_, network, err := net.ParseCIDR(cidr)
@@ -307,6 +482,8 @@ func checkPublicIP(address net.IP) error {
 		kind = "private"
 	case carrierGradeNAT.Contains(address):
 		kind = "CGNAT"
+	case wellKnownNAT64.Contains(address) || localUseNAT64.Contains(address):
+		kind = "NAT64"
 	}
 	if kind != "" {
 		return fmt.Errorf("%w: %s (%s)", ErrPrivateAddress, address, kind)

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 )
 
 var (
@@ -18,6 +19,10 @@ var (
 	ErrChunkIncomplete = errors.New("nexus: synchronization chunk was not fully consumed")
 	// ErrSyncClosed is returned after a synchronization is closed.
 	ErrSyncClosed = errors.New("nexus: synchronization is closed")
+	// ErrSyncPlanChanged is returned when refreshed properties would change the
+	// mode, target, or remaining chunks of an active synchronization. Start a
+	// new synchronization with the latest committed checkpoint.
+	ErrSyncPlanChanged = errors.New("nexus: synchronization plan changed")
 )
 
 type propertiesResponse struct {
@@ -239,9 +244,34 @@ func (sync *Sync) refreshPlan() error {
 	}
 	plan.Target.ETag = properties.etag
 	plan.Target.LastModified = properties.lastModified
+	if !sameRefreshPlan(sync.plan, sync.position, plan) {
+		err := fmt.Errorf("%w: start a new synchronization with the latest committed checkpoint", ErrSyncPlanChanged)
+		sync.terminal = err
+		return err
+	}
 	sync.plan = plan
 	sync.position = 0
 	return nil
+}
+
+func sameRefreshPlan(current SyncPlan, position int, refreshed SyncPlan) bool {
+	return current.Mode == refreshed.Mode &&
+		cursorEqual(current.Target, refreshed.Target) &&
+		slices.Equal(current.Chunks[position:], refreshed.Chunks)
+}
+
+func cursorEqual(left, right Cursor) bool {
+	if left.IndexID != right.IndexID ||
+		left.ChainID != right.ChainID ||
+		!left.Timestamp.Equal(right.Timestamp) ||
+		left.ETag != right.ETag ||
+		left.LastModified != right.LastModified {
+		return false
+	}
+	if left.LastIncremental == nil || right.LastIncremental == nil {
+		return left.LastIncremental == nil && right.LastIncremental == nil
+	}
+	return *left.LastIncremental == *right.LastIncremental
 }
 
 func (sync *Sync) checkpointFor(ref ChunkRef, header Header) Cursor {

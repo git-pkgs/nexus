@@ -52,6 +52,8 @@ for {
 
 `Checkpoint` succeeds only after the chunk reaches a clean gzip EOF and passes its checksum. An early close, truncated response, or malformed record leaves the cursor unchanged. Full synchronization means replacement rather than applying a snapshot over old catalog state.
 
+If an advertised chunk disappears, the client refreshes the properties once. `NextChunk` returns `ErrSyncPlanChanged` if that refresh changes the mode, target, or remaining chunks. Start a new synchronization with the latest committed checkpoint in that case.
+
 The lower-level `NewReader` and `NewRawReader` functions parse saved chunks or caller-managed streams without HTTP.
 
 ## Command
@@ -78,7 +80,9 @@ nexus sync --cursor cursor.json https://repo.example.test/repository/releases/
 
 The command writes newline-delimited JSON. A sync begins with its mode, followed by artifact events and one checkpoint after each verified chunk. The cursor file is read only; the consumer decides when and where to persist checkpoint records.
 
-Private and loopback addresses are refused by default. Use `--allow-private` for a private Maven repository. Library callers can also supply an `http.Client`, parser limits, retry bounds, and the private-address option through `ClientOptions`.
+Private, loopback, CGNAT, and NAT64 addresses are refused by default. The public-address policy bypasses environment proxies and rejects an explicit proxy, custom `RoundTripper`, or custom dialer because those paths cannot be checked at connection time. Set `AllowPrivateAddresses` when using one of those transports and enforce its address policy separately. The command exposes the same opt-out as `--allow-private`.
+
+The default transport applies 30-second connection and response-header timeouts. Body reads also have a 30-second idle timeout, configurable with `ClientOptions.ResponseIdleTimeout`. Parser limits and retry bounds are available through the same options type.
 
 ## Use with other git-pkgs packages
 

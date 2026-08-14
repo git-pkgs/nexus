@@ -83,7 +83,7 @@ func (reader *Reader) Next() (Event, error) {
 		return Event{}, reader.terminal
 	}
 	for {
-		record, err := reader.raw.NextRecord()
+		record, err := reader.raw.nextRecord(eventFieldSelected)
 		if err != nil {
 			return Event{}, err
 		}
@@ -95,6 +95,15 @@ func (reader *Reader) Next() (Event, error) {
 		if emitted {
 			return event, nil
 		}
+	}
+}
+
+func eventFieldSelected(name string) bool {
+	switch name {
+	case fieldUInfo, fieldDeleted, fieldInfo, fieldModified, fieldName, fieldDescription, fieldSHA1:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -275,7 +284,10 @@ func parseInfoFlag(name, value string) (bool, error) {
 		return false, nil
 	case "1":
 		return true, nil
+	case "2":
+		// Maven Indexer uses 2 for ArtifactAvailability.NOT_AVAILABLE.
+		return false, nil
 	default:
-		return false, fmt.Errorf("nexus: parse %s flag %q: want 0 or 1", name, value)
+		return false, fmt.Errorf("nexus: parse %s flag %q: want 0, 1, or 2", name, value)
 	}
 }

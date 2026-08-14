@@ -266,6 +266,77 @@ func TestClientRefreshesPropertiesOnceAfterMissingChunk(t *testing.T) {
 	}
 }
 
+func TestClientStopsWhenRefreshedPlanChanges(t *testing.T) {
+	timestamp := time.Date(2026, time.August, 13, 5, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		refreshed  string
+		wantTarget int64
+	}{
+		{
+			name:       "mode",
+			refreshed:  testIndexProperties(timestamp.Add(time.Minute), "replacement-chain", 1, 1),
+			wantTarget: 41,
+		},
+		{
+			name:       "target",
+			refreshed:  testIndexProperties(timestamp.Add(time.Minute), testChainID, 42, 41, 42),
+			wantTarget: 41,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			initial := testIndexProperties(timestamp, testChainID, 41, 41)
+			var propertiesCalls atomic.Int32
+			var fullChunkCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case testRepositoryPrefix + propertiesPath:
+					if propertiesCalls.Add(1) == 1 {
+						_, _ = io.WriteString(writer, initial)
+					} else {
+						_, _ = io.WriteString(writer, test.refreshed)
+					}
+				case testRepositoryPrefix + ".index/nexus-maven-repository-index.41.gz":
+					http.NotFound(writer, request)
+				case testRepositoryPrefix + fullChunkPath:
+					fullChunkCalls.Add(1)
+					http.Error(writer, "unexpected full chunk", http.StatusInternalServerError)
+				default:
+					http.NotFound(writer, request)
+				}
+			}))
+			defer server.Close()
+
+			last := int64(40)
+			cursor := Cursor{IndexID: testRemoteIndexID, ChainID: testChainID, LastIncremental: &last, Timestamp: timestamp.Add(-time.Minute)}
+			synchronization, err := newLocalClient().Sync(context.Background(), server.URL+testRepositoryPrefix, &cursor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeTestSync(t, synchronization)
+
+			_, err = synchronization.NextChunk()
+			if !errors.Is(err, ErrSyncPlanChanged) {
+				t.Fatalf("NextChunk error = %v, want ErrSyncPlanChanged", err)
+			}
+			if synchronization.Mode() != SyncIncremental {
+				t.Errorf("Mode = %q, want %q", synchronization.Mode(), SyncIncremental)
+			}
+			target := synchronization.Target()
+			if target.LastIncremental == nil || *target.LastIncremental != test.wantTarget {
+				t.Errorf("Target = %+v", target)
+			}
+			if fullChunkCalls.Load() != 0 {
+				t.Errorf("full chunk calls = %d, want 0", fullChunkCalls.Load())
+			}
+			if _, err := synchronization.NextChunk(); !errors.Is(err, ErrSyncPlanChanged) {
+				t.Fatalf("terminal NextChunk error = %v", err)
+			}
+		})
+	}
+}
+
 func TestClientDoesNotRefreshMissingChunkRepeatedly(t *testing.T) {
 	timestamp := time.Date(2026, time.August, 13, 5, 0, 0, 0, time.UTC)
 	properties := testIndexProperties(timestamp, testChainID, 41, 41)

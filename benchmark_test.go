@@ -12,7 +12,10 @@ import (
 	"time"
 )
 
-const benchmarkRecordCount = 100
+const (
+	benchmarkRecordCount       = 100
+	benchmarkIgnoredClassCount = 8_000
+)
 
 const benchmarkProperties = `# benchmark fixture
 nexus.index.id=central
@@ -112,6 +115,48 @@ func BenchmarkReader(b *testing.B) {
 	b.ReportMetric(float64(benchmarkRecordCount*b.N)/b.Elapsed().Seconds(), "records/s")
 }
 
+func BenchmarkRawReaderIgnoredField(b *testing.B) {
+	chunk, valueBytes := benchmarkIgnoredFieldChunk(b)
+	b.ReportAllocs()
+	b.SetBytes(int64(valueBytes))
+	for b.Loop() {
+		reader, err := NewRawReader(bytes.NewReader(chunk), Options{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err = reader.NextRecord(); err != nil {
+			b.Fatal(err)
+		}
+		if _, err = reader.NextRecord(); !errors.Is(err, io.EOF) {
+			b.Fatalf("end error = %v, want EOF", err)
+		}
+		if err := reader.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkReaderIgnoredField(b *testing.B) {
+	chunk, valueBytes := benchmarkIgnoredFieldChunk(b)
+	b.ReportAllocs()
+	b.SetBytes(int64(valueBytes))
+	for b.Loop() {
+		reader, err := NewReader(bytes.NewReader(chunk), Options{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err = reader.Next(); err != nil {
+			b.Fatal(err)
+		}
+		if _, err = reader.Next(); !errors.Is(err, io.EOF) {
+			b.Fatalf("end error = %v, want EOF", err)
+		}
+		if err := reader.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkIncrementalSync(b *testing.B) {
 	chunkData := benchmarkChunk(b)
 	properties := benchmarkProperties
@@ -166,4 +211,15 @@ func benchmarkChunk(b testing.TB) []byte {
 		}}
 	}
 	return makeTestChunk(b, supportedChunkVersion, time.UnixMilli(1786590546000).UTC(), records)
+}
+
+func benchmarkIgnoredFieldChunk(b testing.TB) ([]byte, int) {
+	b.Helper()
+	classNames := strings.Repeat("org/example/Library\n", benchmarkIgnoredClassCount)
+	records := []Record{{Fields: []Field{
+		{Name: "c", Value: classNames},
+		{Name: fieldUInfo, Value: testArtifactIdentity},
+	}}}
+	chunk := makeTestChunk(b, supportedChunkVersion, time.UnixMilli(1786590546000).UTC(), records)
+	return chunk, len(classNames)
 }

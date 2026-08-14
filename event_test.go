@@ -124,6 +124,23 @@ func TestMapRecordExtensionFallback(t *testing.T) {
 	}
 }
 
+func TestMapRecordAcceptsUnavailableArtifactFlags(t *testing.T) {
+	record := Record{Fields: []Field{
+		{Name: fieldUInfo, Value: testMissingClassifierIdentity},
+		{Name: fieldInfo, Value: packagingJAR + "|1|2|2|2|2|jar"},
+	}}
+	event, emitted, err := mapRecord(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !emitted {
+		t.Fatal("record was not emitted")
+	}
+	if event.Artifact.HasSources || event.Artifact.HasJavadoc || event.Artifact.HasSignature {
+		t.Errorf("availability flags = %+v", event.Artifact)
+	}
+}
+
 func TestMapRecordUsesLastDuplicateField(t *testing.T) {
 	record := Record{Fields: []Field{
 		{Name: fieldUInfo, Value: "g|old|1|NA|" + packagingJAR},
@@ -178,6 +195,54 @@ func TestReaderMappingErrorIsTerminal(t *testing.T) {
 	_, secondErr := reader.Next()
 	if firstErr == nil || secondErr == nil || firstErr.Error() != secondErr.Error() {
 		t.Fatalf("errors = %v, %v", firstErr, secondErr)
+	}
+}
+
+func TestReaderDiscardsUnselectedFieldValues(t *testing.T) {
+	classNames := strings.Repeat("org/example/Library\n", 10_000)
+	records := []Record{{Fields: []Field{
+		{Name: "c", Value: classNames},
+		{Name: fieldUInfo, Value: testArtifactIdentity},
+	}}}
+	chunk := makeTestChunk(t, supportedChunkVersion, time.UnixMilli(1).UTC(), records)
+	reader, err := NewReader(bytes.NewReader(chunk), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTestReader(t, reader)
+
+	event, err := reader.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Artifact.ArtifactID != "library" {
+		t.Errorf("event = %+v", event)
+	}
+	if cap(reader.raw.valueBuffer) >= len(classNames) {
+		t.Errorf("value buffer capacity = %d, ignored field length = %d", cap(reader.raw.valueBuffer), len(classNames))
+	}
+	if len(reader.raw.discardBuffer) != discardBufferSize {
+		t.Errorf("discard buffer length = %d, want %d", len(reader.raw.discardBuffer), discardBufferSize)
+	}
+}
+
+func TestReaderValidatesDiscardedFieldValues(t *testing.T) {
+	body := testChunkHeader(supportedChunkVersion, time.UnixMilli(1).UTC())
+	writeInt32(body, 1)
+	body.WriteByte(0)
+	writeUint16(body, 1)
+	body.WriteString("c")
+	writeInt32(body, 1)
+	body.WriteByte(0)
+
+	reader, err := NewReader(bytes.NewReader(gzipTestBody(t, body.Bytes())), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTestReader(t, reader)
+	_, err = reader.Next()
+	if err == nil || !strings.Contains(err.Error(), "NUL must use") {
+		t.Fatalf("error = %v, want invalid modified UTF-8", err)
 	}
 }
 
