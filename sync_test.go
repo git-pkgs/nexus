@@ -44,6 +44,13 @@ func TestClientColdSync(t *testing.T) {
 		}
 		switch request.URL.Path {
 		case testRepositoryPrefix + propertiesPath:
+			if request.Header.Get("If-None-Match") == testPropertiesETagV1 {
+				if request.Header.Get("If-Modified-Since") != "Thu, 13 Aug 2026 04:09:06 GMT" {
+					t.Errorf("If-Modified-Since = %q", request.Header.Get("If-Modified-Since"))
+				}
+				writer.WriteHeader(http.StatusNotModified)
+				return
+			}
 			writer.Header().Set("ETag", testPropertiesETagV1)
 			writer.Header().Set("Last-Modified", "Thu, 13 Aug 2026 04:09:06 GMT")
 			_, _ = io.WriteString(writer, properties)
@@ -97,6 +104,7 @@ func TestClientColdSync(t *testing.T) {
 	wantRequests := []string{
 		testRepositoryPrefix + propertiesPath,
 		testRepositoryPrefix + fullChunkPath,
+		testRepositoryPrefix + propertiesPath,
 	}
 	if !reflect.DeepEqual(gotRequests, wantRequests) {
 		t.Errorf("requests = %v, want %v", gotRequests, wantRequests)
@@ -218,6 +226,91 @@ func TestClientIncrementalCheckpoints(t *testing.T) {
 	}
 }
 
+func TestClientRejectsChangedPropertiesBeforeFinalCheckpoint(t *testing.T) {
+	timestamp := time.Date(2026, time.August, 13, 5, 0, 0, 0, time.UTC)
+	initial := testIndexProperties(timestamp, testChainID, 41, 41)
+	changed := testIndexProperties(timestamp.Add(time.Minute), testChainID, 42, 41, 42)
+	chunkData := makeTestChunk(t, supportedChunkVersion, timestamp, []Record{{Fields: []Field{{Name: fieldUInfo, Value: testShortArtifactIdentity}}}})
+	var propertiesCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case testRepositoryPrefix + propertiesPath:
+			writer.Header().Set("ETag", `"properties"`)
+			if propertiesCalls.Add(1) == 1 {
+				_, _ = io.WriteString(writer, initial)
+			} else {
+				_, _ = io.WriteString(writer, changed)
+			}
+		case testRepositoryPrefix + ".index/nexus-maven-repository-index.41.gz":
+			_, _ = writer.Write(chunkData)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	last := int64(40)
+	cursor := Cursor{IndexID: testRemoteIndexID, ChainID: testChainID, LastIncremental: &last, Timestamp: timestamp.Add(-time.Minute)}
+	synchronization, err := newLocalClient().Sync(context.Background(), server.URL+testRepositoryPrefix, &cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTestSync(t, synchronization)
+	chunk, err := synchronization.NextChunk()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chunk.Next(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chunk.Next(); !errors.Is(err, ErrSyncPlanChanged) {
+		t.Fatalf("final chunk error = %v, want ErrSyncPlanChanged", err)
+	}
+	if _, err := chunk.Checkpoint(); !errors.Is(err, ErrCheckpointUnavailable) {
+		t.Fatalf("Checkpoint error = %v, want ErrCheckpointUnavailable", err)
+	}
+	if _, err := synchronization.NextChunk(); !errors.Is(err, ErrSyncPlanChanged) {
+		t.Fatalf("terminal NextChunk error = %v, want ErrSyncPlanChanged", err)
+	}
+	if propertiesCalls.Load() != 2 {
+		t.Errorf("properties calls = %d, want 2", propertiesCalls.Load())
+	}
+}
+
+func TestValidateChunkHeader(t *testing.T) {
+	timestamp := time.Date(2026, time.August, 13, 5, 0, 0, 0, time.UTC)
+	checkpoint := timestamp.Add(-time.Minute)
+	last := int64(40)
+	synchronization := Sync{
+		plan: SyncPlan{Target: Cursor{IndexID: testRemoteIndexID, Timestamp: timestamp}},
+		cursor: &Cursor{
+			IndexID:         testRemoteIndexID,
+			LastIncremental: &last,
+			Timestamp:       checkpoint,
+		},
+	}
+	ref := ChunkRef{Path: ".index/nexus-maven-repository-index.41.gz", Incremental: true, Counter: 41}
+	tests := []struct {
+		name      string
+		timestamp time.Time
+		wantError bool
+	}{
+		{"checkpoint timestamp", checkpoint, false},
+		{"publication timestamp", timestamp, false},
+		{"zero timestamp", time.UnixMilli(0).UTC(), true},
+		{"before checkpoint", checkpoint.Add(-time.Millisecond), true},
+		{"after publication", timestamp.Add(time.Millisecond), true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := synchronization.validateChunkHeader(ref, Header{Version: supportedChunkVersion, Timestamp: test.timestamp})
+			if test.wantError != errors.Is(err, ErrChunkInconsistent) {
+				t.Errorf("validateChunkHeader error = %v", err)
+			}
+		})
+	}
+}
+
 func TestClientRefreshesPropertiesOnceAfterMissingChunk(t *testing.T) {
 	timestamp := time.Date(2026, time.August, 13, 5, 0, 0, 0, time.UTC)
 	properties := testIndexProperties(timestamp, testChainID, 41, 41)
@@ -227,8 +320,11 @@ func TestClientRefreshesPropertiesOnceAfterMissingChunk(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case testRepositoryPrefix + propertiesPath:
-			propertiesCalls.Add(1)
-			writer.Header().Set("ETag", `"refreshed"`)
+			if propertiesCalls.Add(1) == 3 {
+				writer.Header().Set("ETag", `"revalidated"`)
+			} else {
+				writer.Header().Set("ETag", `"refreshed"`)
+			}
 			_, _ = io.WriteString(writer, properties)
 		case testRepositoryPrefix + ".index/nexus-maven-repository-index.41.gz":
 			if chunkCalls.Add(1) == 1 {
@@ -258,10 +354,10 @@ func TestClientRefreshesPropertiesOnceAfterMissingChunk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if checkpoint.ETag != `"refreshed"` {
+	if checkpoint.ETag != `"revalidated"` {
 		t.Errorf("Checkpoint = %+v", checkpoint)
 	}
-	if propertiesCalls.Load() != 2 || chunkCalls.Load() != 2 {
+	if propertiesCalls.Load() != 3 || chunkCalls.Load() != 2 {
 		t.Errorf("properties calls = %d, chunk calls = %d", propertiesCalls.Load(), chunkCalls.Load())
 	}
 }

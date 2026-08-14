@@ -582,7 +582,7 @@ func retryableStatus(status int) bool {
 func (client *Client) retryDelay(attempt int, response *http.Response) time.Duration {
 	if response != nil {
 		if retryAfter, ok := parseRetryAfter(response.Header.Get("Retry-After")); ok {
-			return min(retryAfter, client.options.maxRetryDelay)
+			return retryAfter
 		}
 	}
 	delay := client.options.retryBaseDelay

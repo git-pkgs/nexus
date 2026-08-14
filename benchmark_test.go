@@ -173,7 +173,7 @@ func BenchmarkIncrementalSync(b *testing.B) {
 	cursor := testCursor("central", "1318453614498", 929, time.Date(2026, time.August, 12, 3, 8, 42, 0, time.UTC))
 	const chunkCount = 6
 	b.ReportAllocs()
-	b.SetBytes(int64(len(properties) + chunkCount*len(chunkData)))
+	b.SetBytes(int64(2*len(properties) + chunkCount*len(chunkData)))
 	b.ResetTimer()
 	for b.Loop() {
 		synchronization, err := client.Sync(context.Background(), server.URL, &cursor)

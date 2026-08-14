@@ -60,7 +60,7 @@ func BenchmarkIncrementalSyncProcess(b *testing.B) {
 		b.Fatal(err)
 	}
 	binary, binarySize := buildBenchmarkBinary(b)
-	b.SetBytes(fixtureSize + int64(len(properties)))
+	b.SetBytes(fixtureSize + 2*int64(len(properties)))
 	b.ResetTimer()
 	for b.Loop() {
 		command := exec.CommandContext(context.Background(), binary, syncCommand, "--allow-private", "--cursor", cursorPath, server.URL)

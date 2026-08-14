@@ -93,6 +93,7 @@ func TestRunSync(t *testing.T) {
 	wantPaths := []string{
 		"/repo/.index/nexus-maven-repository-index.properties",
 		"/repo/.index/nexus-maven-repository-index.gz",
+		"/repo/.index/nexus-maven-repository-index.properties",
 	}
 	if strings.Join(paths, "\n") != strings.Join(wantPaths, "\n") {
 		t.Errorf("paths = %v, want %v", paths, wantPaths)

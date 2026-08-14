@@ -219,6 +219,14 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
+func TestClientDoesNotShortenRetryAfter(t *testing.T) {
+	client := NewClient(ClientOptions{MaxRetryDelay: time.Second})
+	response := &http.Response{Header: http.Header{"Retry-After": []string{"60"}}}
+	if delay := client.retryDelay(0, response); delay != time.Minute {
+		t.Errorf("retry delay = %s, want %s", delay, time.Minute)
+	}
+}
+
 func TestCheckPublicIP(t *testing.T) {
 	tests := []struct {
 		address string

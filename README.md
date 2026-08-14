@@ -50,7 +50,7 @@ for {
 }
 ```
 
-`Checkpoint` succeeds only after the chunk reaches a clean gzip EOF and passes its checksum. An early close, truncated response, or malformed record leaves the cursor unchanged. Full synchronization means replacement rather than applying a snapshot over old catalog state.
+`Checkpoint` succeeds only after the chunk reaches a clean gzip EOF and passes its checksum. Chunk timestamps must not predate the prior cursor or exceed the advertised publication time. Before the final checkpoint, the client conditionally fetches the index properties again and returns `ErrSyncPlanChanged` if the selected plan has changed. An early close, truncated response, malformed record, or inconsistent publication leaves the cursor unchanged. Full synchronization means replacement rather than applying a snapshot over old catalog state.
 
 If an advertised chunk disappears, the client refreshes the properties once. `NextChunk` returns `ErrSyncPlanChanged` if that refresh changes the mode, target, or remaining chunks. Start a new synchronization with the latest committed checkpoint in that case.
 
@@ -82,7 +82,7 @@ The command writes newline-delimited JSON. A sync begins with its mode, followed
 
 Private, loopback, CGNAT, and NAT64 addresses are refused by default. The public-address policy bypasses environment proxies and rejects an explicit proxy, custom `RoundTripper`, or custom dialer because those paths cannot be checked at connection time. Set `AllowPrivateAddresses` when using one of those transports and enforce its address policy separately. The command exposes the same opt-out as `--allow-private`.
 
-The default transport applies 30-second connection and response-header timeouts. Body reads also have a 30-second idle timeout, configurable with `ClientOptions.ResponseIdleTimeout`. Parser limits and retry bounds are available through the same options type.
+The default transport applies 30-second connection and response-header timeouts. Body reads also have a 30-second idle timeout, configurable with `ClientOptions.ResponseIdleTimeout`. Parser limits, retry counts, and locally generated backoff bounds are available through the same options type. A valid server `Retry-After` delay is honored without shortening it.
 
 ## Use with other git-pkgs packages
 

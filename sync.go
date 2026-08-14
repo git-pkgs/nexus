@@ -17,6 +17,9 @@ var (
 	ErrChunkActive = errors.New("nexus: a chunk is already active")
 	// ErrChunkIncomplete is returned after an active chunk is closed early.
 	ErrChunkIncomplete = errors.New("nexus: synchronization chunk was not fully consumed")
+	// ErrChunkInconsistent is returned when a chunk header cannot belong to the
+	// synchronization selected from the remote properties.
+	ErrChunkInconsistent = errors.New("nexus: chunk is inconsistent with synchronization plan")
 	// ErrSyncClosed is returned after a synchronization is closed.
 	ErrSyncClosed = errors.New("nexus: synchronization is closed")
 	// ErrSyncPlanChanged is returned when refreshed properties would change the
@@ -219,17 +222,50 @@ func (sync *Sync) NextChunk() (*Chunk, error) {
 			_ = body.Close()
 			return nil, fmt.Errorf("nexus: open chunk %s: %w", ref.Path, err)
 		}
+		header := reader.Header()
+		if err := sync.validateChunkHeader(ref, header); err != nil {
+			closeErr := errors.Join(reader.Close(), body.Close())
+			sync.terminal = err
+			return nil, errors.Join(err, closeErr)
+		}
 		chunk := &Chunk{
 			parent: sync,
 			ref:    ref,
 			reader: reader,
 			body:   body,
-			header: reader.Header(),
+			header: header,
 		}
-		chunk.checkpoint = sync.checkpointFor(ref, chunk.header)
 		sync.current = chunk
 		return chunk, nil
 	}
+}
+
+func (sync *Sync) validateChunkHeader(ref ChunkRef, header Header) error {
+	if header.Timestamp.UnixMilli() <= 0 {
+		return fmt.Errorf("%w: chunk %s has invalid timestamp %s", ErrChunkInconsistent, ref.Path, header.Timestamp)
+	}
+	if header.Timestamp.After(sync.plan.Target.Timestamp) {
+		return fmt.Errorf(
+			"%w: chunk %s timestamp %s is after advertised publication %s",
+			ErrChunkInconsistent,
+			ref.Path,
+			header.Timestamp,
+			sync.plan.Target.Timestamp,
+		)
+	}
+	if sync.cursor != nil &&
+		sync.cursor.IndexID == sync.plan.Target.IndexID &&
+		!sync.cursor.Timestamp.IsZero() &&
+		header.Timestamp.Before(sync.cursor.Timestamp) {
+		return fmt.Errorf(
+			"%w: chunk %s timestamp %s is before checkpoint %s",
+			ErrChunkInconsistent,
+			ref.Path,
+			header.Timestamp,
+			sync.cursor.Timestamp,
+		)
+	}
+	return nil
 }
 
 func (sync *Sync) refreshPlan() error {
@@ -260,18 +296,49 @@ func sameRefreshPlan(current SyncPlan, position int, refreshed SyncPlan) bool {
 		slices.Equal(current.Chunks[position:], refreshed.Chunks)
 }
 
+func samePlanState(current SyncPlan, position int, refreshed SyncPlan) bool {
+	return current.Mode == refreshed.Mode &&
+		cursorStateEqual(current.Target, refreshed.Target) &&
+		slices.Equal(current.Chunks[position:], refreshed.Chunks)
+}
+
 func cursorEqual(left, right Cursor) bool {
-	if left.IndexID != right.IndexID ||
-		left.ChainID != right.ChainID ||
-		!left.Timestamp.Equal(right.Timestamp) ||
-		left.ETag != right.ETag ||
-		left.LastModified != right.LastModified {
+	return cursorStateEqual(left, right) &&
+		left.ETag == right.ETag &&
+		left.LastModified == right.LastModified
+}
+
+func cursorStateEqual(left, right Cursor) bool {
+	if left.IndexID != right.IndexID || left.ChainID != right.ChainID || !left.Timestamp.Equal(right.Timestamp) {
 		return false
 	}
 	if left.LastIncremental == nil || right.LastIncremental == nil {
 		return left.LastIncremental == nil && right.LastIncremental == nil
 	}
 	return *left.LastIncremental == *right.LastIncremental
+}
+
+func (sync *Sync) revalidateFinalPlan() error {
+	properties, err := sync.client.fetchProperties(sync.ctx, sync.repository, &sync.plan.Target)
+	if err != nil {
+		return fmt.Errorf("nexus: revalidate index properties: %w", err)
+	}
+	if properties.notModified {
+		return nil
+	}
+
+	plan, err := BuildPlan(properties.properties, sync.cursor)
+	if err != nil {
+		return fmt.Errorf("nexus: replan before final checkpoint: %w", err)
+	}
+	plan.Target.ETag = properties.etag
+	plan.Target.LastModified = properties.lastModified
+	if !samePlanState(sync.plan, sync.position, plan) {
+		return fmt.Errorf("%w: repository properties changed before final checkpoint", ErrSyncPlanChanged)
+	}
+	sync.plan.Target.ETag = plan.Target.ETag
+	sync.plan.Target.LastModified = plan.Target.LastModified
+	return nil
 }
 
 func (sync *Sync) checkpointFor(ref ChunkRef, header Header) Cursor {
@@ -290,18 +357,26 @@ func (sync *Sync) checkpointFor(ref ChunkRef, header Header) Cursor {
 	}
 }
 
-func (sync *Sync) finishChunk(chunk *Chunk, complete bool) {
+func (sync *Sync) finishChunk(chunk *Chunk, complete bool) error {
 	if sync.current != chunk {
-		return
+		return nil
 	}
 	sync.current = nil
 	if complete {
+		if sync.position == len(sync.plan.Chunks)-1 {
+			if err := sync.revalidateFinalPlan(); err != nil {
+				sync.terminal = err
+				return err
+			}
+		}
+		chunk.checkpoint = sync.checkpointFor(chunk.ref, chunk.header)
 		checkpoint := cloneCursor(chunk.checkpoint)
 		sync.cursor = &checkpoint
 		sync.position++
-		return
+		return nil
 	}
 	sync.terminal = ErrChunkIncomplete
+	return nil
 }
 
 // Close cancels outstanding requests and closes an active chunk.
@@ -374,9 +449,16 @@ func (chunk *Chunk) finish(complete bool) error {
 	chunk.closed = true
 	readerErr := chunk.reader.Close()
 	bodyErr := chunk.body.Close()
-	chunk.complete = complete && readerErr == nil && bodyErr == nil
-	chunk.parent.finishChunk(chunk, chunk.complete)
-	return errors.Join(readerErr, bodyErr)
+	closeErr := errors.Join(readerErr, bodyErr)
+	if !complete || closeErr != nil {
+		_ = chunk.parent.finishChunk(chunk, false)
+		return closeErr
+	}
+	if err := chunk.parent.finishChunk(chunk, true); err != nil {
+		return err
+	}
+	chunk.complete = true
+	return nil
 }
 
 func cloneCursor(cursor Cursor) Cursor {
