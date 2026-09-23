@@ -4,6 +4,20 @@
 
 It is intended for catalog importers, cache warmers, and Maven proxy services that need registry metadata without crawling artifact paths or fetching every POM. Repository discovery, storage, scheduling, and POM enrichment stay with the calling program.
 
+## Installation
+
+Add the library to your Go module:
+
+```sh
+go get github.com/git-pkgs/nexus
+```
+
+Install the CLI:
+
+```sh
+go install github.com/git-pkgs/nexus/cmd/nexus@latest
+```
+
 ## Library use
 
 Create a client with an optional cursor from the last completed synchronization:
@@ -107,3 +121,7 @@ NEXUS_BENCHMARK_CHUNK=/path/to/nexus-maven-repository-index.gz \
 ```
 
 The process benchmark reports startup-inclusive time, input throughput, executable size, the fixture SHA-256, Go version, operating system, architecture, and `GOMAXPROCS`.
+
+## License
+
+[MIT](LICENSE).
