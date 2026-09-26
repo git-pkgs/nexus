@@ -70,6 +70,8 @@ If an advertised chunk disappears, the client refreshes the properties once. `Ne
 
 The lower-level `NewReader` and `NewRawReader` functions parse saved chunks or caller-managed streams without HTTP.
 
+These readers are available under TinyGo. TinyGo HTTP transports cannot enforce the connection-time public-address policy, so `Client.Sync` returns `ErrUnprotectedTransport` unless `AllowPrivateAddresses` is set. For synchronization, supply a host-compatible `HTTPClient` and enforce address and redirect restrictions in the host.
+
 ## Command
 
 Build the command locally:
@@ -96,7 +98,7 @@ The command writes newline-delimited JSON. A sync begins with its mode, followed
 
 Private, loopback, CGNAT, and NAT64 addresses are refused by default. The public-address policy bypasses environment proxies and rejects an explicit proxy, custom `RoundTripper`, or custom dialer because those paths cannot be checked at connection time. Set `AllowPrivateAddresses` when using one of those transports and enforce its address policy separately. The command exposes the same opt-out as `--allow-private`.
 
-The default transport applies 30-second connection and response-header timeouts. Body reads also have a 30-second idle timeout, configurable with `ClientOptions.ResponseIdleTimeout`. Parser limits, retry counts, and locally generated backoff bounds are available through the same options type. A valid server `Retry-After` delay is honored without shortening it.
+Under standard Go, the default transport applies 30-second connection and response-header timeouts. Body reads also have a 30-second idle timeout, configurable with `ClientOptions.ResponseIdleTimeout`. Parser limits, retry counts, and locally generated backoff bounds are available through the same options type. A valid server `Retry-After` delay is honored without shortening it.
 
 ## Use with other git-pkgs packages
 
